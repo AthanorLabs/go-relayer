@@ -2,8 +2,6 @@ package relayer
 
 import (
 	"context"
-	"errors"
-	"math/big"
 
 	"github.com/athanorlabs/go-relayer/common"
 
@@ -16,60 +14,92 @@ import (
 
 var log = logging.Logger("relayer")
 
-var (
-	errFailedToVerify       = errors.New("failed to verify forward request signature")
-	errFromNotProvided      = errors.New("must provide `from` field in request")
-	errSignatureNotProvided = errors.New("must provide `signature` field in request")
-	errGasNotProvided       = errors.New("must provide `gas` field in request")
-	errNonceNotProvided     = errors.New("must provide `nonce` field in request")
-)
-
+// NewForwardRequestFunc returns a new, empty ForwardRequest that must be
+// compatible with the Forwarder the relayer is configured to use.
 type NewForwardRequestFunc func() common.ForwardRequest
+
+// ValidateTransactionFunc is a user-set transaction validation function.
+// For example, the user may wish to validate the contract being called,
+// or the calldata, to only allow forward requests to specific contracts
+// or with specific data.
+type ValidateTransactionFunc func(*common.SubmitTransactionRequest) error
 
 // Relayer represents a transaction relayer.
 // It contains an Ethereum client and a private key, allowing it to forward transactions.
 type Relayer struct {
-	ctx                   context.Context
-	ec                    *ethclient.Client
-	forwarder             common.Forwarder
-	callOpts              *bind.CallOpts
-	txOpts                *bind.TransactOpts
-	newForwardRequestFunc NewForwardRequestFunc
+	ctx                     context.Context
+	ec                      *ethclient.Client
+	forwarder               common.Forwarder
+	callOpts                *bind.CallOpts
+	txOpts                  *bind.TransactOpts
+	newForwardRequestFunc   NewForwardRequestFunc
+	validateTransactionFunc ValidateTransactionFunc
 }
 
 // Config ...
 type Config struct {
-	Ctx                   context.Context
-	EthClient             *ethclient.Client
-	Forwarder             common.Forwarder
-	Key                   *common.Key
-	ChainID               *big.Int
-	NewForwardRequestFunc NewForwardRequestFunc
+	Ctx                     context.Context
+	EthClient               *ethclient.Client
+	Forwarder               common.Forwarder
+	Key                     *common.Key
+	NewForwardRequestFunc   NewForwardRequestFunc
+	ValidateTransactionFunc ValidateTransactionFunc
 }
 
 func NewRelayer(cfg *Config) (*Relayer, error) {
+	if cfg.Forwarder == nil {
+		return nil, errMustSetForwarder
+	}
+
+	if cfg.NewForwardRequestFunc == nil {
+		return nil, errMustSetNewForwardRequestFunc
+	}
+
+	if cfg.ValidateTransactionFunc == nil {
+		return nil, errMustSetValidateTransactionFunc
+	}
+
+	if cfg.Key == nil {
+		return nil, errMustSetKey
+	}
+
+	if cfg.EthClient == nil {
+		return nil, errMustSetEthClient
+	}
+
 	callOpts := &bind.CallOpts{
 		From:    cfg.Key.Address(),
 		Context: cfg.Ctx,
 	}
 
-	txOpts, err := bind.NewKeyedTransactorWithChainID(cfg.Key.PrivateKey(), cfg.ChainID)
+	chainID, err := cfg.EthClient.ChainID(cfg.Ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	txOpts, err := bind.NewKeyedTransactorWithChainID(cfg.Key.PrivateKey(), chainID)
 	if err != nil {
 		return nil, err
 	}
 
 	return &Relayer{
-		ctx:                   cfg.Ctx,
-		ec:                    cfg.EthClient,
-		forwarder:             cfg.Forwarder,
-		callOpts:              callOpts,
-		txOpts:                txOpts,
-		newForwardRequestFunc: cfg.NewForwardRequestFunc,
+		ctx:                     cfg.Ctx,
+		ec:                      cfg.EthClient,
+		forwarder:               cfg.Forwarder,
+		callOpts:                callOpts,
+		txOpts:                  txOpts,
+		newForwardRequestFunc:   cfg.NewForwardRequestFunc,
+		validateTransactionFunc: cfg.ValidateTransactionFunc,
 	}, nil
 }
 
 func (s *Relayer) SubmitTransaction(req *common.SubmitTransactionRequest) (*common.SubmitTransactionResponse, error) {
 	err := validateRequest(req)
+	if err != nil {
+		return nil, err
+	}
+
+	err = s.validateTransactionFunc(req)
 	if err != nil {
 		return nil, err
 	}

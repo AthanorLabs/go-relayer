@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -43,8 +44,11 @@ func setupAuth(t *testing.T) (*bind.TransactOpts, *ethclient.Client, *ecdsa.Priv
 }
 
 func TestMock_Execute(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+	defer cancel()
+
 	auth, conn, pk := setupAuth(t)
-	chainID, err := conn.ChainID(context.Background())
+	chainID, err := conn.ChainID(ctx)
 	require.NoError(t, err)
 
 	address, tx, contract, err := mforwarder.DeployMinimalForwarder(auth, conn)
@@ -61,8 +65,9 @@ func TestMock_Execute(t *testing.T) {
 	value := big.NewInt(1000000)
 	fee := big.NewInt(10000)
 
-	gasPrice, err := conn.SuggestGasPrice(context.Background())
+	gasPrice, err := conn.SuggestGasPrice(ctx)
 	require.NoError(t, err)
+	t.Logf("suggested gas price: %d", gasPrice)
 
 	transferTx := ethtypes.NewTransaction(
 		0,
@@ -75,9 +80,12 @@ func TestMock_Execute(t *testing.T) {
 
 	transferTx, err = ethtypes.SignTx(transferTx, ethtypes.LatestSignerForChainID(chainID), pk)
 	require.NoError(t, err)
-	err = conn.SendTransaction(context.Background(), transferTx)
+	err = conn.SendTransaction(ctx, transferTx)
 	require.NoError(t, err)
-	tests.MineTransaction(t, conn, transferTx)
+	receipt, err = bind.WaitMined(ctx, conn, transferTx)
+	require.NoError(t, err)
+	require.Equal(t, ethtypes.ReceiptStatusSuccessful, receipt.Status)
+	t.Logf("transfer sent: %s", transferTx.Hash())
 
 	// generate ForwardRequest and sign it
 	key := common.NewKeyFromPrivateKey(pk)
@@ -122,6 +130,7 @@ func TestMock_Execute(t *testing.T) {
 	ok, err := contract.Verify(callOpts, *req, sig)
 	require.NoError(t, err)
 	require.True(t, ok)
+	t.Logf("verified forward request")
 
 	// execute withdraw() via forwarder
 	tx, err = contract.Execute(auth, *req, sig)
@@ -132,7 +141,7 @@ func TestMock_Execute(t *testing.T) {
 	require.Equal(t, 1, len(receipt.Logs))
 
 	// check that transfer worked
-	mockBalance, err := conn.BalanceAt(context.Background(), mockAddress, nil)
+	mockBalance, err := conn.BalanceAt(ctx, mockAddress, nil)
 	require.NoError(t, err)
 	require.Equal(t, int64(0), mockBalance.Int64())
 }

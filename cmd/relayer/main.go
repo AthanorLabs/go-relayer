@@ -15,8 +15,10 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/urfave/cli/v2"
 
+	p2pnet "github.com/athanorlabs/go-p2p-net"
 	"github.com/athanorlabs/go-relayer/common"
 	contracts "github.com/athanorlabs/go-relayer/impls/gsnforwarder"
+	"github.com/athanorlabs/go-relayer/net"
 	"github.com/athanorlabs/go-relayer/relayer"
 	"github.com/athanorlabs/go-relayer/rpc"
 
@@ -30,6 +32,12 @@ const (
 	flagRPCPort          = "rpc-port"
 	flagDeploy           = "deploy"
 	flagLog              = "log-level"
+	flagWithNetwork      = "with-network"
+	flagLibp2pKey        = "libp2p-key"
+	flagLibp2pPort       = "libp2p-port"
+	flagBootnodes        = "bootnodes"
+
+	defaultLibp2pPort = 10900
 )
 
 var (
@@ -64,6 +72,27 @@ var (
 			Value: "info",
 			Usage: "Set log level: one of [error|warn|info|debug]",
 		},
+		&cli.BoolFlag{
+			Name:  flagWithNetwork,
+			Value: false,
+			Usage: "Run the relayer with p2p network capabilities",
+		},
+		&cli.StringFlag{
+			Name:  flagLibp2pKey,
+			Usage: "libp2p private key",
+			Value: fmt.Sprintf("%s/node.key", os.TempDir()),
+		},
+		&cli.UintFlag{
+			Name:  flagLibp2pPort,
+			Usage: "libp2p port to listen on",
+			Value: defaultLibp2pPort,
+		},
+		&cli.StringSliceFlag{
+			Name:    flagBootnodes,
+			Aliases: []string{"bn"},
+			Usage:   "libp2p bootnode, comma separated if passing multiple to a single flag",
+			EnvVars: []string{"SWAPD_BOOTNODES"},
+		},
 	}
 
 	errInvalidAddress       = errors.New("invalid forwarder address")
@@ -72,11 +101,13 @@ var (
 
 func main() {
 	app := &cli.App{
-		Name:    "relayer",
-		Usage:   "Ethereum transaction relayer",
-		Version: getVersion(),
-		Flags:   flags,
-		Action:  run,
+		Name:                 "relayer",
+		Usage:                "Ethereum transaction relayer",
+		Version:              getVersion(),
+		Flags:                flags,
+		Action:               run,
+		EnableBashCompletion: true,
+		Suggest:              true,
 	}
 
 	if err := app.Run(os.Args); err != nil {
@@ -158,13 +189,27 @@ func run(c *cli.Context) error {
 		EthClient:             ec,
 		Forwarder:             contracts.NewIForwarderWrapped(forwarder),
 		Key:                   key,
-		ChainID:               chainID,
 		NewForwardRequestFunc: contracts.NewIForwarderForwardRequest,
+		ValidateTransactionFunc: func(_ *common.SubmitTransactionRequest) error {
+			// Note: an actual application will likely want to set this
+			return nil
+		},
 	}
 
 	r, err := relayer.NewRelayer(cfg)
 	if err != nil {
 		return err
+	}
+
+	if c.Bool(flagWithNetwork) {
+		h, err := setupNework(c, ec, r.SubmitTransaction)
+		if err != nil {
+			return err
+		}
+
+		defer func() {
+			_ = h.Stop()
+		}()
 	}
 
 	rpcCfg := &rpc.Config{
@@ -182,7 +227,49 @@ func run(c *cli.Context) error {
 	if errors.Is(err, context.Canceled) || errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
+
 	return err
+}
+
+func setupNework(c *cli.Context, ec *ethclient.Client, handleTransactionFunc net.HandleTransactionFunc) (*net.Host, error) {
+	chainID, err := ec.ChainID(context.Background())
+	if err != nil {
+		return nil, err
+	}
+
+	var bootnodes []string
+	if c.IsSet(flagBootnodes) {
+		bootnodes = expandBootnodes(c.StringSlice(flagBootnodes))
+	}
+
+	listenIP := "0.0.0.0"
+	netCfg := &p2pnet.Config{
+		Ctx:        context.Background(),
+		DataDir:    os.TempDir(),
+		Port:       uint16(c.Uint(flagLibp2pPort)),
+		KeyFile:    c.String(flagLibp2pKey),
+		Bootnodes:  bootnodes,
+		ProtocolID: fmt.Sprintf("/%s/%d", net.ProtocolID, chainID.Int64()),
+		ListenIP:   listenIP,
+	}
+
+	cfg := &net.Config{
+		P2pConfig:             netCfg,
+		HandleTransactionFunc: handleTransactionFunc,
+		IsRelayer:             true,
+	}
+
+	h, err := net.NewHost(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	err = h.Start()
+	if err != nil {
+		return nil, err
+	}
+
+	return h, nil
 }
 
 func deployOrGetForwarder(
@@ -230,4 +317,23 @@ func getPrivateKey(keyFile string) (*common.Key, error) {
 		return common.NewKeyFromPrivateKeyString(keyHex)
 	}
 	return nil, errNoEthereumPrivateKey
+}
+
+// expandBootnodes expands the boot nodes passed on the command line that
+// can be specified individually with multiple flags, but can also contain
+// multiple boot nodes passed to single flag separated by commas.
+func expandBootnodes(nodesCLI []string) []string {
+	var nodes []string // nodes from all flag values combined
+	for _, flagVal := range nodesCLI {
+		splitNodes := strings.Split(flagVal, ",")
+		for _, n := range splitNodes {
+			n = strings.TrimSpace(n)
+			// Handle the empty string to not use default bootnodes. Doing it here after
+			// the split has the arguably positive side effect of skipping empty entries.
+			if len(n) > 0 {
+				nodes = append(nodes, strings.TrimSpace(n))
+			}
+		}
+	}
+	return nodes
 }

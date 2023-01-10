@@ -8,7 +8,7 @@ build:
 .PHONY: lint
 lint:
 	bash scripts/install-lint.sh
-	${GOPATH}/bin/golangci-lint run
+	${GOPATH}/bin/golangci-lint run --timeout 2m
 
 .PHONY: format
 format:
@@ -16,7 +16,7 @@ format:
 
 .PHONY: test
 test:
-	go test -count=1 ./...
+	go test -count=1 ./... -v -timeout=2m
 
 .PHONY: clean
 clean:
